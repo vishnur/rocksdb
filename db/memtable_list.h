@@ -7,21 +7,29 @@
 
 #include <string>
 #include <list>
+#include <vector>
+#include <set>
 #include <deque>
+#include "rocksdb/db.h"
+#include "rocksdb/options.h"
+#include "rocksdb/iterator.h"
 
 #include "db/dbformat.h"
-#include "db/memtable.h"
+#include "db/filename.h"
 #include "db/skiplist.h"
-#include "rocksdb/db.h"
+#include "db/memtable.h"
 #include "rocksdb/db.h"
 #include "rocksdb/iterator.h"
 #include "rocksdb/options.h"
 #include "util/autovector.h"
+#include "util/log_buffer.h"
 
 namespace rocksdb {
 
+class ColumnFamilyData;
 class InternalKeyComparator;
 class Mutex;
+class MergeIteratorBuilder;
 
 // keeps a list of immutable memtables in a vector. the list is immutable
 // if refcount is bigger than one. It is used as a state for Get() and
@@ -38,10 +46,15 @@ class MemTableListVersion {
   // Search all the memtables starting from the most recent one.
   // Return the most recent value found, if any.
   bool Get(const LookupKey& key, std::string* value, Status* s,
-           MergeContext& merge_context, const Options& options);
+           MergeContext* merge_context);
 
   void AddIterators(const ReadOptions& options,
-                    std::vector<Iterator*>* iterator_list);
+                    std::vector<Iterator*>* iterator_list, Arena* arena);
+
+  void AddIterators(const ReadOptions& options,
+                    MergeIteratorBuilder* merge_iter_builder);
+
+  uint64_t GetTotalNumEntries() const;
 
  private:
   // REQUIRE: m is mutable memtable
@@ -65,41 +78,44 @@ class MemTableList {
  public:
   // A list of memtables.
   explicit MemTableList(int min_write_buffer_number_to_merge)
-      : min_write_buffer_number_to_merge_(min_write_buffer_number_to_merge),
+      : imm_flush_needed(false),
+        min_write_buffer_number_to_merge_(min_write_buffer_number_to_merge),
         current_(new MemTableListVersion()),
         num_flush_not_started_(0),
         commit_in_progress_(false),
         flush_requested_(false) {
-    imm_flush_needed.Release_Store(nullptr);
     current_->Ref();
   }
   ~MemTableList() {}
 
   MemTableListVersion* current() { return current_; }
 
-  // so that backgrund threads can detect non-nullptr pointer to
-  // determine whether this is anything more to start flushing.
-  port::AtomicPointer imm_flush_needed;
+  // so that background threads can detect non-nullptr pointer to
+  // determine whether there is anything more to start flushing.
+  std::atomic<bool> imm_flush_needed;
 
   // Returns the total number of memtables in the list
   int size() const;
 
   // Returns true if there is at least one memtable on which flush has
   // not yet started.
-  bool IsFlushPending();
+  bool IsFlushPending() const;
 
   // Returns the earliest memtables that needs to be flushed. The returned
   // memtables are guaranteed to be in the ascending order of created time.
   void PickMemtablesToFlush(autovector<MemTable*>* mems);
 
+  // Reset status of the given memtable list back to pending state so that
+  // they can get picked up again on the next round of flush.
+  void RollbackMemtableFlush(const autovector<MemTable*>& mems,
+                             uint64_t file_number);
+
   // Commit a successful flush in the manifest file
-  Status InstallMemtableFlushResults(const autovector<MemTable*>& m,
-                                     VersionSet* vset, Status flushStatus,
-                                     port::Mutex* mu, Logger* info_log,
-                                     uint64_t file_number,
-                                     std::set<uint64_t>& pending_outputs,
-                                     autovector<MemTable*>* to_delete,
-                                     Directory* db_directory);
+  Status InstallMemtableFlushResults(
+      ColumnFamilyData* cfd, const MutableCFOptions& mutable_cf_options,
+      const autovector<MemTable*>& m, VersionSet* vset, port::Mutex* mu,
+      uint64_t file_number, autovector<MemTable*>* to_delete,
+      Directory* db_directory, LogBuffer* log_buffer);
 
   // New memtables are inserted at the front of the list.
   // Takes ownership of the referenced held on *m by the caller of Add().

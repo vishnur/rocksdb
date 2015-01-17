@@ -116,13 +116,16 @@ class Cache {
     // default implementation is noop
   };
 
+  // Apply callback to all entries in the cache
+  // If thread_safe is true, it will also lock the accesses. Otherwise, it will
+  // access the cache without the lock held
+  virtual void ApplyToAllCacheEntries(void (*callback)(void*, size_t),
+                                      bool thread_safe) = 0;
+
  private:
   void LRU_Remove(Handle* e);
   void LRU_Append(Handle* e);
   void Unref(Handle* e);
-
-  struct Rep;
-  Rep* rep_;
 
   // No copying allowed
   Cache(const Cache&);

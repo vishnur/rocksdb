@@ -3,7 +3,12 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 
+#include "table/table_properties_internal.h"
 #include "rocksdb/table_properties.h"
+#include "rocksdb/iterator.h"
+#include "rocksdb/env.h"
+#include "port/port.h"
+#include "util/string_util.h"
 
 namespace rocksdb {
 
@@ -28,7 +33,7 @@ namespace {
       const std::string& prop_delim,
       const std::string& kv_delim) {
     AppendProperty(
-        props, key, std::to_string(value), prop_delim, kv_delim
+        props, key, ToString(value), prop_delim, kv_delim
     );
   }
 }
@@ -91,5 +96,23 @@ const std::string TablePropertiesNames::kFixedKeyLen =
     "rocksdb.fixed.key.length";
 
 extern const std::string kPropertiesBlock = "rocksdb.properties";
+// Old property block name for backward compatibility
+extern const std::string kPropertiesBlockOldName = "rocksdb.stats";
+
+// Seek to the properties block.
+// Return true if it successfully seeks to the properties block.
+Status SeekToPropertiesBlock(Iterator* meta_iter, bool* is_found) {
+  *is_found = true;
+  meta_iter->Seek(kPropertiesBlock);
+  if (meta_iter->status().ok() &&
+      (!meta_iter->Valid() || meta_iter->key() != kPropertiesBlock)) {
+    meta_iter->Seek(kPropertiesBlockOldName);
+    if (meta_iter->status().ok() &&
+        (!meta_iter->Valid() || meta_iter->key() != kPropertiesBlockOldName)) {
+      *is_found = false;
+    }
+  }
+  return meta_iter->status();
+}
 
 }  // namespace rocksdb

@@ -3,6 +3,7 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
+#ifndef ROCKSDB_LITE
 #include "rocksdb/memtablerep.h"
 
 #include <unordered_set>
@@ -24,13 +25,14 @@ using namespace stl_wrappers;
 
 class VectorRep : public MemTableRep {
  public:
-  VectorRep(const KeyComparator& compare, Arena* arena, size_t count);
+  VectorRep(const KeyComparator& compare, MemTableAllocator* allocator,
+            size_t count);
 
   // Insert key into the collection. (The caller will pack key and value into a
   // single buffer and pass that in as the parameter to Insert)
   // REQUIRES: nothing that compares equal to key is currently in the
   // collection.
-  virtual void Insert(const char* key) override;
+  virtual void Insert(KeyHandle handle) override;
 
   // Returns true iff an entry that compares equal to key is in the collection.
   virtual bool Contains(const char* key) const override;
@@ -38,6 +40,10 @@ class VectorRep : public MemTableRep {
   virtual void MarkReadOnly() override;
 
   virtual size_t ApproximateMemoryUsage() override;
+
+  virtual void Get(const LookupKey& k, void* callback_args,
+                   bool (*callback_func)(void* arg,
+                                         const char* entry)) override;
 
   virtual ~VectorRep() override { }
 
@@ -86,11 +92,8 @@ class VectorRep : public MemTableRep {
     virtual void SeekToLast() override;
   };
 
-  // Unhide default implementations of GetIterator()
-  using MemTableRep::GetIterator;
-
   // Return an iterator over the keys in this representation.
-  virtual MemTableRep::Iterator* GetIterator() override;
+  virtual MemTableRep::Iterator* GetIterator(Arena* arena) override;
 
  private:
   friend class Iterator;
@@ -102,8 +105,8 @@ class VectorRep : public MemTableRep {
   const KeyComparator& compare_;
 };
 
-void VectorRep::Insert(const char* key) {
-  assert(!Contains(key));
+void VectorRep::Insert(KeyHandle handle) {
+  auto* key = static_cast<char*>(handle);
   WriteLock l(&rwlock_);
   assert(!immutable_);
   bucket_->push_back(key);
@@ -129,8 +132,10 @@ size_t VectorRep::ApproximateMemoryUsage() {
     );
 }
 
-VectorRep::VectorRep(const KeyComparator& compare, Arena* arena, size_t count)
-  : bucket_(new Bucket()),
+VectorRep::VectorRep(const KeyComparator& compare, MemTableAllocator* allocator,
+                     size_t count)
+  : MemTableRep(allocator),
+    bucket_(new Bucket()),
     immutable_(false),
     sorted_(false),
     compare_(compare) { bucket_.get()->reserve(count); }
@@ -233,22 +238,55 @@ void VectorRep::Iterator::SeekToLast() {
   }
 }
 
-MemTableRep::Iterator* VectorRep::GetIterator() {
+void VectorRep::Get(const LookupKey& k, void* callback_args,
+                    bool (*callback_func)(void* arg, const char* entry)) {
+  rwlock_.ReadLock();
+  VectorRep* vector_rep;
+  std::shared_ptr<Bucket> bucket;
+  if (immutable_) {
+    vector_rep = this;
+  } else {
+    vector_rep = nullptr;
+    bucket.reset(new Bucket(*bucket_));  // make a copy
+  }
+  VectorRep::Iterator iter(vector_rep, immutable_ ? bucket_ : bucket, compare_);
+  rwlock_.ReadUnlock();
+
+  for (iter.Seek(k.user_key(), k.memtable_key().data());
+       iter.Valid() && callback_func(callback_args, iter.key()); iter.Next()) {
+  }
+}
+
+MemTableRep::Iterator* VectorRep::GetIterator(Arena* arena) {
+  char* mem = nullptr;
+  if (arena != nullptr) {
+    mem = arena->AllocateAligned(sizeof(Iterator));
+  }
   ReadLock l(&rwlock_);
   // Do not sort here. The sorting would be done the first time
   // a Seek is performed on the iterator.
   if (immutable_) {
-    return new Iterator(this, bucket_, compare_);
+    if (arena == nullptr) {
+      return new Iterator(this, bucket_, compare_);
+    } else {
+      return new (mem) Iterator(this, bucket_, compare_);
+    }
   } else {
     std::shared_ptr<Bucket> tmp;
     tmp.reset(new Bucket(*bucket_)); // make a copy
-    return new Iterator(nullptr, tmp, compare_);
+    if (arena == nullptr) {
+      return new Iterator(nullptr, tmp, compare_);
+    } else {
+      return new (mem) Iterator(nullptr, tmp, compare_);
+    }
   }
 }
 } // anon namespace
 
 MemTableRep* VectorRepFactory::CreateMemTableRep(
-    MemTableRep::KeyComparator& compare, Arena* arena) {
-  return new VectorRep(compare, arena, count_);
+    const MemTableRep::KeyComparator& compare, MemTableAllocator* allocator,
+    const SliceTransform*, Logger* logger) {
+  return new VectorRep(compare, allocator, count_);
 }
 } // namespace rocksdb
+#endif  // ROCKSDB_LITE

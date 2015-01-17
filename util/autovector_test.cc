@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <iostream>
+#include <utility>
 
 #include "rocksdb/env.h"
 #include "util/autovector.h"
@@ -48,11 +49,11 @@ TEST(AutoVectorTest, PushBackAndPopBack) {
 }
 
 TEST(AutoVectorTest, EmplaceBack) {
-  typedef std::pair<size_t, std::string> ValueType;
-  autovector<ValueType, kSize> vec;
+  typedef std::pair<size_t, std::string> ValType;
+  autovector<ValType, kSize> vec;
 
   for (size_t i = 0; i < 1000 * kSize; ++i) {
-    vec.emplace_back(i, std::to_string(i + 123));
+    vec.emplace_back(i, ToString(i + 123));
     ASSERT_TRUE(!vec.empty());
     if (i < kSize) {
       ASSERT_TRUE(vec.only_in_stack());
@@ -62,7 +63,7 @@ TEST(AutoVectorTest, EmplaceBack) {
 
     ASSERT_EQ(i + 1, vec.size());
     ASSERT_EQ(i, vec[i].first);
-    ASSERT_EQ(std::to_string(i + 123), vec[i].second);
+    ASSERT_EQ(ToString(i + 123), vec[i].second);
   }
 
   vec.clear();
@@ -70,6 +71,29 @@ TEST(AutoVectorTest, EmplaceBack) {
   ASSERT_TRUE(!vec.only_in_stack());
 }
 
+TEST(AutoVectorTest, Resize) {
+  autovector<size_t, kSize> vec;
+
+  vec.resize(kSize);
+  ASSERT_TRUE(vec.only_in_stack());
+  for (size_t i = 0; i < kSize; ++i) {
+    vec[i] = i;
+  }
+
+  vec.resize(kSize * 2);
+  ASSERT_TRUE(!vec.only_in_stack());
+  for (size_t i = 0; i < kSize; ++i) {
+    ASSERT_EQ(vec[i], i);
+  }
+  for (size_t i = 0; i < kSize; ++i) {
+    vec[i + kSize] = i;
+  }
+
+  vec.resize(1);
+  ASSERT_EQ(1U, vec.size());
+}
+
+namespace {
 void AssertEqual(
     const autovector<size_t, kSize>& a, const autovector<size_t, kSize>& b) {
   ASSERT_EQ(a.size(), b.size());
@@ -79,6 +103,7 @@ void AssertEqual(
     ASSERT_EQ(a[i], b[i]);
   }
 }
+}  // namespace
 
 TEST(AutoVectorTest, CopyAndAssignment) {
   // Test both heap-allocated and stack-allocated cases.
@@ -104,7 +129,7 @@ TEST(AutoVectorTest, CopyAndAssignment) {
 TEST(AutoVectorTest, Iterators) {
   autovector<std::string, kSize> vec;
   for (size_t i = 0; i < kSize * 1000; ++i) {
-    vec.push_back(std::to_string(i));
+    vec.push_back(ToString(i));
   }
 
   // basic operator test
@@ -159,6 +184,7 @@ TEST(AutoVectorTest, Iterators) {
   }
 }
 
+namespace {
 vector<string> GetTestKeys(size_t size) {
   vector<string> keys;
   keys.resize(size);
@@ -169,6 +195,7 @@ vector<string> GetTestKeys(size_t size) {
   }
   return keys;
 }
+}  // namespace
 
 template<class TVector>
 void BenchmarkVectorCreationAndInsertion(

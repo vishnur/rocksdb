@@ -1,4 +1,5 @@
-build_config.mk
+TARGETS
+make_config.mk
 
 *.a
 *.arc
@@ -12,6 +13,13 @@ build_config.mk
 *_test
 *_bench
 *_stress
+*.out
+*.class
+*.jar
+*.*jnilib*
+*.d-e
+*.o-*
+*.swp
 
 ldb
 manifest_dump
@@ -20,4 +28,19 @@ util/build_version.cc
 build_tools/VALGRIND_LOGS/
 coverage/COVERAGE_REPORT
 .gdbhistory
+package/
 .phutil_module_cache
+tags
+
+java/out
+java/*.log
+java/include/org_rocksdb_*.h
+
+.idea/
+*.iml
+
+unity.cc
+java/crossbuild/.vagrant
+.vagrant/
+java/**.asc
+java/javadoc

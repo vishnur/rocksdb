@@ -14,8 +14,8 @@
 //  (4) Items are never deleted.
 // The liberal use of assertions is encouraged to enforce (1).
 //
-// The factory will be passed an Arena object when a new MemTableRep is
-// requested. The API for this object is in rocksdb/arena.h.
+// The factory will be passed an MemTableAllocator object when a new MemTableRep
+// is requested.
 //
 // Users can implement their own memtable representations. We include three
 // types built in:
@@ -41,8 +41,13 @@
 namespace rocksdb {
 
 class Arena;
+class MemTableAllocator;
+class LookupKey;
 class Slice;
 class SliceTransform;
+class Logger;
+
+typedef void* KeyHandle;
 
 class MemTableRep {
  public:
@@ -61,11 +66,19 @@ class MemTableRep {
     virtual ~KeyComparator() { }
   };
 
+  explicit MemTableRep(MemTableAllocator* allocator) : allocator_(allocator) {}
+
+  // Allocate a buf of len size for storing key. The idea is that a specific
+  // memtable representation knows its underlying data structure better. By
+  // allowing it to allocate memory, it can possibly put correlated stuff
+  // in consecutive memory area to make processor prefetching more efficient.
+  virtual KeyHandle Allocate(const size_t len, char** buf);
+
   // Insert key into the collection. (The caller will pack key and value into a
-  // single buffer and pass that in as the parameter to Insert)
+  // single buffer and pass that in as the parameter to Insert).
   // REQUIRES: nothing that compares equal to key is currently in the
   // collection.
-  virtual void Insert(const char* key) = 0;
+  virtual void Insert(KeyHandle handle) = 0;
 
   // Returns true iff an entry that compares equal to key is in the collection.
   virtual bool Contains(const char* key) const = 0;
@@ -74,8 +87,22 @@ class MemTableRep {
   // nothing.
   virtual void MarkReadOnly() { }
 
+  // Look up key from the mem table, since the first key in the mem table whose
+  // user_key matches the one given k, call the function callback_func(), with
+  // callback_args directly forwarded as the first parameter, and the mem table
+  // key as the second parameter. If the return value is false, then terminates.
+  // Otherwise, go through the next key.
+  // It's safe for Get() to terminate after having finished all the potential
+  // key for the k.user_key(), or not.
+  //
+  // Default:
+  // Get() function with a default value of dynamically construct an iterator,
+  // seek and call the call back function.
+  virtual void Get(const LookupKey& k, void* callback_args,
+                   bool (*callback_func)(void* arg, const char* entry));
+
   // Report an approximation of how much memory has been used other than memory
-  // that was allocated through the arena.
+  // that was allocated through the allocator.
   virtual size_t ApproximateMemoryUsage() = 0;
 
   virtual ~MemTableRep() { }
@@ -116,28 +143,36 @@ class MemTableRep {
   };
 
   // Return an iterator over the keys in this representation.
-  virtual Iterator* GetIterator() = 0;
-
-  // Return an iterator over at least the keys with the specified user key. The
-  // iterator may also allow access to other keys, but doesn't have to. Default:
-  // GetIterator().
-  virtual Iterator* GetIterator(const Slice& user_key) { return GetIterator(); }
-
-  // Return an iterator over at least the keys with the specified prefix. The
-  // iterator may also allow access to other keys, but doesn't have to. Default:
-  // GetIterator().
-  virtual Iterator* GetPrefixIterator(const Slice& prefix) {
-    return GetIterator();
-  }
+  // arena: If not null, the arena needs to be used to allocate the Iterator.
+  //        When destroying the iterator, the caller will not call "delete"
+  //        but Iterator::~Iterator() directly. The destructor needs to destroy
+  //        all the states but those allocated in arena.
+  virtual Iterator* GetIterator(Arena* arena = nullptr) = 0;
 
   // Return an iterator that has a special Seek semantics. The result of
   // a Seek might only include keys with the same prefix as the target key.
-  virtual Iterator* GetDynamicPrefixIterator() { return GetIterator(); }
+  // arena: If not null, the arena is used to allocate the Iterator.
+  //        When destroying the iterator, the caller will not call "delete"
+  //        but Iterator::~Iterator() directly. The destructor needs to destroy
+  //        all the states but those allocated in arena.
+  virtual Iterator* GetDynamicPrefixIterator(Arena* arena = nullptr) {
+    return GetIterator(arena);
+  }
+
+  // Return true if the current MemTableRep supports merge operator.
+  // Default: true
+  virtual bool IsMergeOperatorSupported() const { return true; }
+
+  // Return true if the current MemTableRep supports snapshot
+  // Default: true
+  virtual bool IsSnapshotSupported() const { return true; }
 
  protected:
   // When *key is an internal key concatenated with the value, returns the
   // user key.
   virtual Slice UserKey(const char* key) const;
+
+  MemTableAllocator* allocator_;
 };
 
 // This is the base class for all factories that are used by RocksDB to create
@@ -145,11 +180,35 @@ class MemTableRep {
 class MemTableRepFactory {
  public:
   virtual ~MemTableRepFactory() {}
-  virtual MemTableRep* CreateMemTableRep(MemTableRep::KeyComparator&,
-                                         Arena*) = 0;
+  virtual MemTableRep* CreateMemTableRep(const MemTableRep::KeyComparator&,
+                                         MemTableAllocator*,
+                                         const SliceTransform*,
+                                         Logger* logger) = 0;
   virtual const char* Name() const = 0;
 };
 
+// This uses a skip list to store keys. It is the default.
+//
+// Parameters:
+//   lookahead: If non-zero, each iterator's seek operation will start the
+//     search from the previously visited record (doing at most 'lookahead'
+//     steps). This is an optimization for the access pattern including many
+//     seeks with consecutive keys.
+class SkipListFactory : public MemTableRepFactory {
+ public:
+  explicit SkipListFactory(size_t lookahead = 0) : lookahead_(lookahead) {}
+
+  virtual MemTableRep* CreateMemTableRep(const MemTableRep::KeyComparator&,
+                                         MemTableAllocator*,
+                                         const SliceTransform*,
+                                         Logger* logger) override;
+  virtual const char* Name() const override { return "SkipListFactory"; }
+
+ private:
+  const size_t lookahead_;
+};
+
+#ifndef ROCKSDB_LITE
 // This creates MemTableReps that are backed by an std::vector. On iteration,
 // the vector is sorted. This is useful for workloads where iteration is very
 // rare and writes are generally not issued after reads begin.
@@ -163,20 +222,12 @@ class VectorRepFactory : public MemTableRepFactory {
 
  public:
   explicit VectorRepFactory(size_t count = 0) : count_(count) { }
-  virtual MemTableRep* CreateMemTableRep(MemTableRep::KeyComparator&,
-                                         Arena*) override;
+  virtual MemTableRep* CreateMemTableRep(const MemTableRep::KeyComparator&,
+                                         MemTableAllocator*,
+                                         const SliceTransform*,
+                                         Logger* logger) override;
   virtual const char* Name() const override {
     return "VectorRepFactory";
-  }
-};
-
-// This uses a skip list to store keys. It is the default.
-class SkipListFactory : public MemTableRepFactory {
- public:
-  virtual MemTableRep* CreateMemTableRep(MemTableRep::KeyComparator&,
-                                         Arena*) override;
-  virtual const char* Name() const override {
-    return "SkipListFactory";
   }
 };
 
@@ -187,15 +238,65 @@ class SkipListFactory : public MemTableRepFactory {
 // skiplist_branching_factor: probabilistic size ratio between adjacent
 //                            link lists in the skiplist
 extern MemTableRepFactory* NewHashSkipListRepFactory(
-  const SliceTransform* transform, size_t bucket_count = 1000000,
-  int32_t skiplist_height = 4, int32_t skiplist_branching_factor = 4
+    size_t bucket_count = 1000000, int32_t skiplist_height = 4,
+    int32_t skiplist_branching_factor = 4
 );
 
-// The factory is to create memtables with a hashed linked list:
-// it contains a fixed array of buckets, each pointing to a sorted single
-// linked list (null if the bucket is empty).
-// bucket_count: number of fixed array buckets
+// The factory is to create memtables based on a hash table:
+// it contains a fixed array of buckets, each pointing to either a linked list
+// or a skip list if number of entries inside the bucket exceeds
+// threshold_use_skiplist.
+// @bucket_count: number of fixed array buckets
+// @huge_page_tlb_size: if <=0, allocate the hash table bytes from malloc.
+//                      Otherwise from huge page TLB. The user needs to reserve
+//                      huge pages for it to be allocated, like:
+//                          sysctl -w vm.nr_hugepages=20
+//                      See linux doc Documentation/vm/hugetlbpage.txt
+// @bucket_entries_logging_threshold: if number of entries in one bucket
+//                                    exceeds this number, log about it.
+// @if_log_bucket_dist_when_flash: if true, log distribution of number of
+//                                 entries when flushing.
+// @threshold_use_skiplist: a bucket switches to skip list if number of
+//                          entries exceed this parameter.
 extern MemTableRepFactory* NewHashLinkListRepFactory(
-    const SliceTransform* transform, size_t bucket_count = 50000);
+    size_t bucket_count = 50000, size_t huge_page_tlb_size = 0,
+    int bucket_entries_logging_threshold = 4096,
+    bool if_log_bucket_dist_when_flash = true,
+    uint32_t threshold_use_skiplist = 256);
 
+// This factory creates a cuckoo-hashing based mem-table representation.
+// Cuckoo-hash is a closed-hash strategy, in which all key/value pairs
+// are stored in the bucket array itself intead of in some data structures
+// external to the bucket array.  In addition, each key in cuckoo hash
+// has a constant number of possible buckets in the bucket array.  These
+// two properties together makes cuckoo hash more memory efficient and
+// a constant worst-case read time.  Cuckoo hash is best suitable for
+// point-lookup workload.
+//
+// When inserting a key / value, it first checks whether one of its possible
+// buckets is empty.  If so, the key / value will be inserted to that vacant
+// bucket.  Otherwise, one of the keys originally stored in one of these
+// possible buckets will be "kicked out" and move to one of its possible
+// buckets (and possibly kicks out another victim.)  In the current
+// implementation, such "kick-out" path is bounded.  If it cannot find a
+// "kick-out" path for a specific key, this key will be stored in a backup
+// structure, and the current memtable to be forced to immutable.
+//
+// Note that currently this mem-table representation does not support
+// snapshot (i.e., it only queries latest state) and iterators.  In addition,
+// MultiGet operation might also lose its atomicity due to the lack of
+// snapshot support.
+//
+// Parameters:
+//   write_buffer_size: the write buffer size in bytes.
+//   average_data_size: the average size of key + value in bytes.  This value
+//     together with write_buffer_size will be used to compute the number
+//     of buckets.
+//   hash_function_count: the number of hash functions that will be used by
+//     the cuckoo-hash.  The number also equals to the number of possible
+//     buckets each key will have.
+extern MemTableRepFactory* NewHashCuckooRepFactory(
+    size_t write_buffer_size, size_t average_data_size = 64,
+    unsigned int hash_function_count = 4);
+#endif  // ROCKSDB_LITE
 }  // namespace rocksdb

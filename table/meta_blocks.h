@@ -6,6 +6,7 @@
 
 #include <map>
 #include <memory>
+#include <vector>
 #include <string>
 
 #include "db/builder.h"
@@ -14,12 +15,14 @@
 #include "rocksdb/slice.h"
 #include "rocksdb/table_properties.h"
 #include "table/block_builder.h"
+#include "table/format.h"
 
 namespace rocksdb {
 
 class BlockBuilder;
 class BlockHandle;
 class Env;
+class Footer;
 class Logger;
 class RandomAccessFile;
 struct TableProperties;
@@ -90,25 +93,23 @@ void LogPropertiesCollectionError(
 // NotifyCollectTableCollectorsOnAdd() triggers the `Add` event for all
 // property collectors.
 bool NotifyCollectTableCollectorsOnAdd(
-    const Slice& key,
-    const Slice& value,
-    const Options::TablePropertiesCollectors& collectors,
+    const Slice& key, const Slice& value,
+    const std::vector<std::unique_ptr<TablePropertiesCollector>>& collectors,
     Logger* info_log);
 
 // NotifyCollectTableCollectorsOnAdd() triggers the `Finish` event for all
 // property collectors. The collected properties will be added to `builder`.
 bool NotifyCollectTableCollectorsOnFinish(
-    const Options::TablePropertiesCollectors& collectors,
-    Logger* info_log,
-    PropertyBlockBuilder* builder);
+    const std::vector<std::unique_ptr<TablePropertiesCollector>>& collectors,
+    Logger* info_log, PropertyBlockBuilder* builder);
 
 // Read the properties from the table.
 // @returns a status to indicate if the operation succeeded. On success,
 //          *table_properties will point to a heap-allocated TableProperties
 //          object, otherwise value of `table_properties` will not be modified.
-Status ReadProperties(const Slice& handle_value, RandomAccessFile* file,
-                      Env* env, Logger* logger,
-                      TableProperties** table_properties);
+Status ReadProperties(const Slice &handle_value, RandomAccessFile *file,
+                      const Footer &footer, Env *env, Logger *logger,
+                      TableProperties **table_properties);
 
 // Directly read the properties from the properties block of a plain table.
 // @returns a status to indicate if the operation succeeded. On success,
@@ -118,10 +119,24 @@ Status ReadTableProperties(RandomAccessFile* file, uint64_t file_size,
                            uint64_t table_magic_number, Env* env,
                            Logger* info_log, TableProperties** properties);
 
-// Read the magic number of the specified file directly.  The magic number
-// of a valid sst table the last 8-byte of the file.
-Status ReadTableMagicNumber(const std::string& file_path,
-                            const Options& options,
-                            const EnvOptions& env_options,
-                            uint64_t* table_magic_number);
+
+// Find the meta block from the meta index block.
+Status FindMetaBlock(Iterator* meta_index_iter,
+                     const std::string& meta_block_name,
+                     BlockHandle* block_handle);
+
+// Find the meta block
+Status FindMetaBlock(RandomAccessFile* file, uint64_t file_size,
+                     uint64_t table_magic_number, Env* env,
+                     const std::string& meta_block_name,
+                     BlockHandle* block_handle);
+
+// Read the specified meta block with name meta_block_name
+// from `file` and initialize `contents` with contents of this block.
+// Return Status::OK in case of success.
+Status ReadMetaBlock(RandomAccessFile* file, uint64_t file_size,
+                     uint64_t table_magic_number, Env* env,
+                     const std::string& meta_block_name,
+                     BlockContents* contents);
+
 }  // namespace rocksdb

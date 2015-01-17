@@ -4,7 +4,7 @@
 #pragma once
 
 #include <string>
-#include <unordered_map>
+#include <map>
 #include "rocksdb/status.h"
 
 namespace rocksdb {
@@ -14,7 +14,16 @@ namespace rocksdb {
 // collected properties.
 // The value of the user-collected properties are encoded as raw bytes --
 // users have to interprete these values by themselves.
-typedef std::unordered_map<std::string, std::string> UserCollectedProperties;
+// Note: To do prefix seek/scan in `UserCollectedProperties`, you can do
+// something similar to:
+//
+// UserCollectedProperties props = ...;
+// for (auto pos = props.lower_bound(prefix);
+//      pos != props.end() && pos->first.compare(0, prefix.size(), prefix) == 0;
+//      ++pos) {
+//   ...
+// }
+typedef std::map<const std::string, std::string> UserCollectedProperties;
 
 // TableProperties contains a bunch of read-only properties of its associated
 // table.
@@ -70,7 +79,10 @@ extern const std::string kPropertiesBlock;
 
 // `TablePropertiesCollector` provides the mechanism for users to collect
 // their own interested properties. This class is essentially a collection
-//  of callback functions that will be invoked during table building.
+// of callback functions that will be invoked during table building.
+// It is construced with TablePropertiesCollectorFactory. The methods don't
+// need to be thread-safe, as we will create exactly one
+// TablePropertiesCollector object per table and then call it sequentially
 class TablePropertiesCollector {
  public:
   virtual ~TablePropertiesCollector() {}
@@ -86,12 +98,24 @@ class TablePropertiesCollector {
   // `properties`.
   virtual Status Finish(UserCollectedProperties* properties) = 0;
 
-  // The name of the properties collector can be used for debugging purpose.
-  virtual const char* Name() const = 0;
-
   // Return the human-readable properties, where the key is property name and
   // the value is the human-readable form of value.
   virtual UserCollectedProperties GetReadableProperties() const = 0;
+
+  // The name of the properties collector can be used for debugging purpose.
+  virtual const char* Name() const = 0;
+};
+
+// Constructs TablePropertiesCollector. Internals create a new
+// TablePropertiesCollector for each new table
+class TablePropertiesCollectorFactory {
+ public:
+  virtual ~TablePropertiesCollectorFactory() {}
+  // has to be thread-safe
+  virtual TablePropertiesCollector* CreateTablePropertiesCollector() = 0;
+
+  // The name of the properties collector can be used for debugging purpose.
+  virtual const char* Name() const = 0;
 };
 
 // Extra properties

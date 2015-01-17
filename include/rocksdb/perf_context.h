@@ -7,6 +7,7 @@
 #define STORAGE_ROCKSDB_INCLUDE_PERF_CONTEXT_H
 
 #include <stdint.h>
+#include <string>
 
 namespace rocksdb {
 
@@ -19,12 +20,17 @@ enum PerfLevel {
 // set the perf stats level
 void SetPerfLevel(PerfLevel level);
 
+// get current perf stats level
+PerfLevel GetPerfLevel();
+
 // A thread local context for gathering performance counter efficiently
 // and transparently.
 
 struct PerfContext {
 
   void Reset(); // reset all performance counters to zero
+
+  std::string ToString() const;
 
   uint64_t user_key_comparison_count; // total number of user key comparisons
   uint64_t block_cache_hit_count;     // total number of block cache hits
@@ -61,7 +67,11 @@ struct PerfContext {
   uint64_t write_memtable_time;
 };
 
+#if defined(NPERF_CONTEXT) || defined(IOS_CROSS_COMPILE)
+extern PerfContext perf_context;
+#else
 extern __thread PerfContext perf_context;
+#endif
 
 }
 

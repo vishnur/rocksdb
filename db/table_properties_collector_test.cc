@@ -11,6 +11,7 @@
 #include "db/dbformat.h"
 #include "db/table_properties_collector.h"
 #include "rocksdb/table.h"
+#include "rocksdb/immutable_options.h"
 #include "table/block_based_table_factory.h"
 #include "table/meta_blocks.h"
 #include "table/plain_table_factory.h"
@@ -83,14 +84,18 @@ class DumbLogger : public Logger {
 };
 
 // Utilities test functions
+namespace {
 void MakeBuilder(const Options& options,
+                 const ImmutableCFOptions& ioptions,
                  const InternalKeyComparator& internal_comparator,
                  std::unique_ptr<FakeWritableFile>* writable,
                  std::unique_ptr<TableBuilder>* builder) {
   writable->reset(new FakeWritableFile);
-  builder->reset(options.table_factory->NewTableBuilder(
-      options, internal_comparator, writable->get(), options.compression));
+  builder->reset(ioptions.table_factory->NewTableBuilder(
+      ioptions, internal_comparator, writable->get(),
+      options.compression, options.compression_opts));
 }
+}  // namespace
 
 // Collects keys that starts with "A" in a table.
 class RegularKeysStartWithA: public TablePropertiesCollector {
@@ -116,16 +121,24 @@ class RegularKeysStartWithA: public TablePropertiesCollector {
    }
 
   virtual UserCollectedProperties GetReadableProperties() const {
-      return {};
+    return UserCollectedProperties{};
   }
-
 
  private:
   uint32_t count_ = 0;
 };
 
+class RegularKeysStartWithAFactory : public TablePropertiesCollectorFactory {
+ public:
+  virtual TablePropertiesCollector* CreateTablePropertiesCollector() {
+    return new RegularKeysStartWithA();
+  }
+  const char* Name() const { return "RegularKeysStartWithA"; }
+};
+
 extern uint64_t kBlockBasedTableMagicNumber;
 extern uint64_t kPlainTableMagicNumber;
+namespace {
 void TestCustomizedTablePropertiesCollector(
     uint64_t magic_number, bool encode_as_internal, const Options& options,
     const InternalKeyComparator& internal_comparator) {
@@ -143,7 +156,8 @@ void TestCustomizedTablePropertiesCollector(
   // -- Step 1: build table
   std::unique_ptr<TableBuilder> builder;
   std::unique_ptr<FakeWritableFile> writable;
-  MakeBuilder(options, internal_comparator, &writable, &builder);
+  const ImmutableCFOptions ioptions(options);
+  MakeBuilder(options, ioptions, internal_comparator, &writable, &builder);
 
   for (const auto& kv : kvs) {
     if (encode_as_internal) {
@@ -178,20 +192,21 @@ void TestCustomizedTablePropertiesCollector(
   ASSERT_TRUE(GetVarint32(&key, &starts_with_A));
   ASSERT_EQ(3u, starts_with_A);
 }
+}  // namespace
 
 TEST(TablePropertiesTest, CustomizedTablePropertiesCollector) {
   // Test properties collectors with internal keys or regular keys
   // for block based table
   for (bool encode_as_internal : { true, false }) {
     Options options;
-    auto collector = new RegularKeysStartWithA();
+    std::shared_ptr<TablePropertiesCollectorFactory> collector_factory(
+        new RegularKeysStartWithAFactory());
     if (encode_as_internal) {
-      options.table_properties_collectors = {
-        std::make_shared<UserKeyTablePropertiesCollector>(collector)
-      };
+      options.table_properties_collector_factories.emplace_back(
+          new UserKeyTablePropertiesCollectorFactory(collector_factory));
     } else {
-      options.table_properties_collectors.resize(1);
-      options.table_properties_collectors[0].reset(collector);
+      options.table_properties_collector_factories.resize(1);
+      options.table_properties_collector_factories[0] = collector_factory;
     }
     test::PlainInternalKeyComparator ikc(options.comparator);
     TestCustomizedTablePropertiesCollector(kBlockBasedTableMagicNumber,
@@ -200,15 +215,22 @@ TEST(TablePropertiesTest, CustomizedTablePropertiesCollector) {
 
   // test plain table
   Options options;
-  options.table_properties_collectors.push_back(
-      std::make_shared<RegularKeysStartWithA>()
-  );
-  options.table_factory = std::make_shared<PlainTableFactory>(8, 8, 0);
+  options.table_properties_collector_factories.emplace_back(
+      new RegularKeysStartWithAFactory());
+
+  PlainTableOptions plain_table_options;
+  plain_table_options.user_key_len = 8;
+  plain_table_options.bloom_bits_per_key = 8;
+  plain_table_options.hash_table_ratio = 0;
+
+  options.table_factory =
+      std::make_shared<PlainTableFactory>(plain_table_options);
   test::PlainInternalKeyComparator ikc(options.comparator);
   TestCustomizedTablePropertiesCollector(kPlainTableMagicNumber, true, options,
                                          ikc);
 }
 
+namespace {
 void TestInternalKeyPropertiesCollector(
     uint64_t magic_number,
     bool sanitized,
@@ -230,9 +252,8 @@ void TestInternalKeyPropertiesCollector(
 
   options.table_factory = table_factory;
   if (sanitized) {
-    options.table_properties_collectors = {
-      std::make_shared<RegularKeysStartWithA>()
-    };
+    options.table_properties_collector_factories.emplace_back(
+        new RegularKeysStartWithAFactory());
     // with sanitization, even regular properties collector will be able to
     // handle internal keys.
     auto comparator = options.comparator;
@@ -240,46 +261,44 @@ void TestInternalKeyPropertiesCollector(
     // SanitizeOptions().
     options.info_log = std::make_shared<DumbLogger>();
     options = SanitizeOptions("db",            // just a place holder
-                              &pikc, nullptr,  // don't care filter policy
+                              &pikc,
                               options);
     options.comparator = comparator;
   } else {
-    options.table_properties_collectors = {
-      std::make_shared<InternalKeyPropertiesCollector>()
-    };
+    options.table_properties_collector_factories = {
+        std::make_shared<InternalKeyPropertiesCollectorFactory>()};
   }
+  const ImmutableCFOptions ioptions(options);
 
-  MakeBuilder(options, pikc, &writable, &builder);
-  for (const auto& k : keys) {
-    builder->Add(k.Encode(), "val");
-  }
+  for (int iter = 0; iter < 2; ++iter) {
+    MakeBuilder(options, ioptions, pikc, &writable, &builder);
+    for (const auto& k : keys) {
+      builder->Add(k.Encode(), "val");
+    }
 
-  ASSERT_OK(builder->Finish());
+    ASSERT_OK(builder->Finish());
 
-  FakeRandomeAccessFile readable(writable->contents());
-  TableProperties* props;
-  Status s = ReadTableProperties(
-      &readable,
-      writable->contents().size(),
-      magic_number,
-      Env::Default(),
-      nullptr,
-      &props
-  );
-  ASSERT_OK(s);
+    FakeRandomeAccessFile readable(writable->contents());
+    TableProperties* props;
+    Status s =
+        ReadTableProperties(&readable, writable->contents().size(),
+                            magic_number, Env::Default(), nullptr, &props);
+    ASSERT_OK(s);
 
-  std::unique_ptr<TableProperties> props_guard(props);
-  auto user_collected = props->user_collected_properties;
-  uint64_t deleted = GetDeletedKeys(user_collected);
-  ASSERT_EQ(4u, deleted);
+    std::unique_ptr<TableProperties> props_guard(props);
+    auto user_collected = props->user_collected_properties;
+    uint64_t deleted = GetDeletedKeys(user_collected);
+    ASSERT_EQ(4u, deleted);
 
-  if (sanitized) {
-    uint32_t starts_with_A = 0;
-    Slice key(user_collected.at("Count"));
-    ASSERT_TRUE(GetVarint32(&key, &starts_with_A));
-    ASSERT_EQ(1u, starts_with_A);
+    if (sanitized) {
+      uint32_t starts_with_A = 0;
+      Slice key(user_collected.at("Count"));
+      ASSERT_TRUE(GetVarint32(&key, &starts_with_A));
+      ASSERT_EQ(1u, starts_with_A);
+    }
   }
 }
+}  // namespace
 
 TEST(TablePropertiesTest, InternalKeyPropertiesCollector) {
   TestInternalKeyPropertiesCollector(
@@ -292,11 +311,15 @@ TEST(TablePropertiesTest, InternalKeyPropertiesCollector) {
       true /* not sanitize */,
       std::make_shared<BlockBasedTableFactory>()
   );
+
+  PlainTableOptions plain_table_options;
+  plain_table_options.user_key_len = 8;
+  plain_table_options.bloom_bits_per_key = 8;
+  plain_table_options.hash_table_ratio = 0;
+
   TestInternalKeyPropertiesCollector(
-      kPlainTableMagicNumber,
-      false /* not sanitize */,
-      std::make_shared<PlainTableFactory>(8, 8, 0)
-  );
+      kPlainTableMagicNumber, false /* not sanitize */,
+      std::make_shared<PlainTableFactory>(plain_table_options));
 }
 
 }  // namespace rocksdb

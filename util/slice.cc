@@ -9,6 +9,7 @@
 
 #include "rocksdb/slice_transform.h"
 #include "rocksdb/slice.h"
+#include "util/string_util.h"
 
 namespace rocksdb {
 
@@ -17,13 +18,14 @@ namespace {
 class FixedPrefixTransform : public SliceTransform {
  private:
   size_t prefix_len_;
+  std::string name_;
 
  public:
-  explicit FixedPrefixTransform(size_t prefix_len) : prefix_len_(prefix_len) { }
+  explicit FixedPrefixTransform(size_t prefix_len)
+      : prefix_len_(prefix_len),
+        name_("rocksdb.FixedPrefix." + ToString(prefix_len_)) {}
 
-  virtual const char* Name() const {
-    return "rocksdb.FixedPrefix";
-  }
+  virtual const char* Name() const { return name_.c_str(); }
 
   virtual Slice Transform(const Slice& src) const {
     assert(InDomain(src));

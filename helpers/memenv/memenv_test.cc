@@ -2,8 +2,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#include "helpers/memenv/memenv.h"
-
 #include "db/db_impl.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
@@ -223,6 +221,15 @@ TEST(MemEnvTest, DBTest) {
     ASSERT_TRUE(res == vals[i]);
   }
 
+  delete db;
+
+  options.create_if_missing = false;
+  ASSERT_OK(DB::Open(options, "/dir/db", &db));
+  for (size_t i = 0; i < 3; ++i) {
+    std::string res;
+    ASSERT_OK(db->Get(ReadOptions(), keys[i], &res));
+    ASSERT_TRUE(res == vals[i]);
+  }
   delete db;
 }
 

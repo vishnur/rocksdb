@@ -12,6 +12,10 @@
 
 namespace rocksdb {
 
+#ifdef ROCKSDB_LITE
+template <class T, size_t kSize = 8>
+class autovector : public std::vector<T> {};
+#else
 // A vector that leverages pre-allocated stack-based array to achieve better
 // performance for array with small amount of items.
 //
@@ -20,7 +24,7 @@ namespace rocksdb {
 // full-fledged generic container.
 //
 // Currently we don't support:
-//  * reserve()/shrink_to_fit()/resize()
+//  * reserve()/shrink_to_fit()
 //     If used correctly, in most cases, people should not touch the
 //     underlying vector at all.
 //  * random insert()/erase(), please only use push_back()/pop_back().
@@ -63,26 +67,26 @@ class autovector {
     iterator_impl& operator=(const iterator_impl&) = default;
 
     // -- Advancement
-    // iterator++
+    // ++iterator
     self_type& operator++() {
       ++index_;
       return *this;
     }
 
-    // ++iterator
+    // iterator++
     self_type operator++(int) {
       auto old = *this;
       ++index_;
       return old;
     }
 
-    // iterator--
+    // --iterator
     self_type& operator--() {
       --index_;
       return *this;
     }
 
-    // --iterator
+    // iterator--
     self_type operator--(int) {
       auto old = *this;
       --index_;
@@ -172,6 +176,18 @@ class autovector {
 
   size_type size() const { return num_stack_items_ + vect_.size(); }
 
+  // resize does not guarantee anything about the contents of the newly
+  // available elements
+  void resize(size_type n) {
+    if (n > kSize) {
+      vect_.resize(n - kSize);
+      num_stack_items_ = kSize;
+    } else {
+      vect_.clear();
+      num_stack_items_ = n;
+    }
+  }
+
   bool empty() const { return size() == 0; }
 
   // will not check boundry
@@ -185,16 +201,12 @@ class autovector {
 
   // will check boundry
   const_reference at(size_type n) const {
-    if (n >= size()) {
-      throw std::out_of_range("autovector: index out of range");
-    }
+    assert(n < size());
     return (*this)[n];
   }
 
   reference at(size_type n) {
-    if (n >= size()) {
-      throw std::out_of_range("autovector: index out of range");
-    }
+    assert(n < size());
     return (*this)[n];
   }
 
@@ -299,5 +311,5 @@ autovector<T, kSize>& autovector<T, kSize>::assign(const autovector& other) {
 
   return *this;
 }
-
-}  // rocksdb
+#endif  // ROCKSDB_LITE
+}  // namespace rocksdb
